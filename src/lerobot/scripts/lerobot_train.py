@@ -111,6 +111,7 @@ else:
     PeftModel = None
 
 if TYPE_CHECKING or _accelerate_available:
+    from accelerate import skip_first_batches
     from accelerate.utils import send_to_device
 
 from .lerobot_eval import eval_policy_all
@@ -320,6 +321,30 @@ def update_policy(
     if output_dict:
         train_metrics.update_metrics(output_dict)
     return train_metrics, output_dict
+
+
+def _cycle_training_dataloader(dataloader: Any, sampler: object) -> Iterator[Any]:
+    """Cycle a prepared loader from the sampler's restored epoch and sample offset.
+
+    Skip consumed batches after sharding so uneven shards retain the original
+    epoch's padding. Skipped samples are never read from the dataset.
+    """
+    if isinstance(sampler, EpisodeAwareSampler):
+        require_package("accelerate", extra="training")
+        state = sampler.state_dict()
+        epoch, start = state["epoch"], state["start_index"]
+        dataloader.set_epoch(epoch)
+        if start and start % dataloader.total_batch_size == 0:
+            sampler.load_state_dict({"epoch": epoch, "start_index": 0})
+            resumed = skip_first_batches(dataloader, start // dataloader.total_batch_size)
+            resumed.set_epoch(epoch)
+            yield from resumed
+            # Release the one-epoch wrapper before starting the regular worker pool.
+            del resumed
+            dataloader.set_epoch(epoch + 1)
+        # A changed batch size or topology can leave an unaligned offset.
+        # Keep its existing sampler-level offset in that case.
+    yield from cycle(dataloader)
 
 
 def make_dataloaders(
@@ -732,6 +757,7 @@ def train(cfg: TrainPipelineConfig) -> None:
         step = resume_before_prepare(cfg)  # step + RNG only; sharded state loads after prepare
 
     dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
+    map_sampler = dataloader.sampler
 
     # --- prepare & resume phase 2 ---------------------------------------------------------------
     # The FSDP wrap-unit class names resolve right before prepare: user override, else the
@@ -799,7 +825,7 @@ def train(cfg: TrainPipelineConfig) -> None:
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    dl_iter = cycle(dataloader)
+    dl_iter = _cycle_training_dataloader(dataloader, map_sampler)
     policy.train()
 
     train_metrics = {
